@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	//"net/http/httputil"
 	"net/url"
 	"os"
 	"regexp"
@@ -22,6 +23,10 @@ var linksRE = regexp.MustCompile(`<a href="/url\?q=([^&]+)`)
 var domainRE = regexp.MustCompile(`https?://([^/]+)`)
 
 type task interface{}
+type g struct {
+	kwd  string
+	page int
+}
 
 func init() {
 	log.SetFlags(log.Lshortfile)
@@ -85,35 +90,47 @@ func newMgo(url string) *mgo.Session {
 func main() {
 
 	kwdCh := produceKeywords()
-	gurlCh := multiplex(kwdCh, func(t task, out chan task) task {
+
+	gurlCh := tube(kwdCh, 1, func(t task) []task {
+		resp := make([]task, 0, 10)
 		for i := 0; i < 10; i++ {
-			out <- fmt.Sprintf("http://www.google.com/search?q=%s&gbv=2&gws_rd=ssl&num=100&start=%d00", t.(string), i)
+			resp = append(resp, g{t.(string), i})
 		}
+		return resp
 	})
 
-	linkCh := tube(gurlCh, 3, func(t task) task {
-		return
+	linkCh := tube(gurlCh, 3, func(t task) []task {
+		g := t.(g)
+		links := linksFromG(g.kwd, g.page)
+		resp := make([]task, 0, len(links))
+		for _, l := range links {
+			log.Printf("DEBUG: got link %v", l)
+			resp = append(resp, l)
+		}
+		log.Printf("DEEEEEBUG:  %v", resp)
+		return resp
 	})
 
-	linkCh := produceLinks(kwdCh)
+	savedCh := tube(linkCh, 100, func(t task) []task {
+		shop := makeShop(t.(string))
+		return []task{shop}
+	})
 
-	savedCh := produceSavedlinks(linkCh)
-	printChan(linkCh)
+	printChan(savedCh)
 	/*
-		savedCh := produceSavedlinks(linkCh)
 		shopCh := produceFilteredShop(savedCh)
 		mailCh := produceMails(shopCh)
 	*/
 }
 
-func printChan(ch chan string) {
+func printChan(ch chan task) {
 	for s := range ch {
 		log.Printf("chan str: %v\n", s)
 	}
 }
 
-func produceKeywords() chan string {
-	kwdCh := make(chan interface{}, 1)
+func produceKeywords() chan task {
+	kwdCh := make(chan task, 1)
 	go func() {
 		buf := bufio.NewReader(os.Stdin)
 
@@ -138,7 +155,7 @@ func produceKeywords() chan string {
 
 			}
 
-			log.Printf("got input keydord: %s", line)
+			log.Printf("got input keyword: %s", line)
 			kwdCh <- string(line)
 		}
 	}()
@@ -187,11 +204,12 @@ func linksFromG(kwd string, page int) []string {
 		}
 		links = append(links, link)
 	}
+	log.Printf("Got %d links for key %s page %d", len(links), kwd, page)
 	return links
 }
 
 func requestG(kwd string, page int) string {
-	url := fmt.Sprintf("http://www.google.com/search?q=%s&gbv=2&gws_rd=ssl&num=100&start=%d00", kwd, page)
+	url := fmt.Sprintf("http://www.google.com/search?q=%s&gbv=2&gws_rd=ssl&num=100&start=%d00", url.QueryEscape(kwd), page)
 
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -204,6 +222,9 @@ func requestG(kwd string, page int) string {
 	req.Header.Set("Accept-Language", "ru-RU,ru;q=0.8,en-US;q=0.6,en;q=0.4,vi;q=0.2")
 	req.Header.Set("Cache-Control", "max-age=0")
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
+
+	//dump, _ := httputil.DumpRequest(req, false)
+	//log.Printf("request to Google:\n%s\n", string(dump))
 
 	resp, err := web.Do(req)
 	if err != nil {
@@ -218,21 +239,25 @@ func requestG(kwd string, page int) string {
 		return ""
 	}
 
-	return string(body)
+	s := string(body)
+	//log.Printf("Got Google body: %s", s)
+	return s
 }
 
-type worker func(task) task
+type worker func(task) []task
 
 func tube(in chan task, cnt int, work worker) chan task {
+	log.Printf("init %d workers of type %v, ", cnt, work)
 	out := make(chan task, 1)
 	go func() {
-		var sem = make(chan int, cnt)
+		sem := make(chan int, cnt)
 		for task := range in {
+			log.Printf("read task %v for worker %v, ", task, work)
 			sem <- 1
 			go func() {
-				result := work(task)
-				if result != "" {
-					out <- result
+				tasks := work(task)
+				for _, t := range tasks {
+					out <- t
 				}
 				<-sem
 			}()
@@ -241,6 +266,7 @@ func tube(in chan task, cnt int, work worker) chan task {
 		// loop ends in if incoming channel was closed
 		// we have to wait till started workers are finish and then close outgoing channel
 		for i := 0; i < cnt; i++ {
+			log.Printf("wait for %d workers of type %v, ", cnt-i, work)
 			sem <- 1
 		}
 		close(out)
@@ -296,14 +322,18 @@ func makeShop(link string) *Shop {
 		Stage:  STG_NEW,
 	}
 
+	log.Printf("going to save shop %s", shop.Domain)
 	err := col.Insert(shop)
 	if err == nil {
+		log.Printf("can't save shop %s", shop.Domain)
 		return shop
 	}
+	log.Printf("saved shop %s", shop.Domain)
 
 	if mgo.IsDup(err) {
 		return nil
 	}
 
 	log.Panicf("can't save shop to db, err: %#v", err)
+	return nil
 }
