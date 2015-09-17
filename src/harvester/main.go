@@ -48,7 +48,7 @@ func newMgo(url string) *mgo.Session {
 
 	// Optional. Switch the session to a monotonic behavior.
 	sess.SetMode(mgo.Monotonic, true)
-	c := sess.DB("").C("shops")
+	c := sess.DB("").C(MGO_COLLECTION)
 
 	// create indexes if don't exist
 	indexes := []mgo.Index{
