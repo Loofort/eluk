@@ -47,6 +47,113 @@ func glinksWorker(ctx context.Context, in <-chan string, out chan<- LinksBlob, e
 
 		// query 10 pages one by one, without concurrency in order to protect from ban
 		for i := 0; i < 10; i++ {
+
+			e = make(chan err, 1)
+			o = make(chan LinksBlob, 1)
+
+			go func() {
+				if links, err := ggl.getLinks(ctx, key, i); err != nil {
+					e <- err
+				} else {
+					o <- links
+				}
+			}()
+
+			select {
+			case <-ctx.Done():
+				return
+			case errc <- <-e:
+			case out <- <-o:
+			}
+
+			///////////////////////////
+
+			d = make(chan struct{})
+			go func() {
+				if links, err := ggl.getLinks(ctx, key, i); err != nil {
+					errc <- err
+				} else {
+					out <- links
+				}
+				close(d)
+			}()
+
+			select {
+			case <-ctx.Done():
+				errc = make(chan err, 1)
+				out = make(chan LinksBlob, 1)
+				return
+			case <-d:
+			}
+
+			///////////////////////////
+			links, err := ggl.getLinks(ctx, key, i)
+
+			if err != nil {
+				select {
+				case errc <- err:
+					continue
+				case <-ctx.Done():
+					return
+				}
+			}
+
+			select {
+			case out <- LinksBlob(links, key):
+			case <-ctx.Done():
+				return
+			}
+
+			///////////////////////
+
+			links, err := ggl.getLinks(ctx, key, i)
+
+			if err != nil {
+				if err == context.Canceled {
+					return
+				}
+
+				select {
+				case <-ctx.Done():
+					return
+				case errc <- err:
+					continue
+				}
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case out <- LinksBlob(links, key):
+			}
+
+			///////////////////////
+
+			links, err := ggl.getLinks(ctx, key, i)
+
+			if err != nil {
+				if err == context.Canceled {
+					return
+				}
+				errc <- err
+				continue
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case out <- LinksBlob(links, key):
+			}
+
+		}
+	}
+}
+
+func glinksWorker(ctx context.Context, in <-chan string, out chan<- LinksBlob, errc chan<- error) {
+	for key := range in {
+
+		// query 10 pages one by one, without concurrency in order to protect from ban
+		for i := 0; i < 10; i++ {
 			links, err := ggl.getLinks(ctx, key, i)
 
 			if err != nil {
