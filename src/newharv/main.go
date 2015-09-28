@@ -47,88 +47,6 @@ func glinksWorker(ctx context.Context, in <-chan string, out chan<- LinksBlob, e
 
 		// query 10 pages one by one, without concurrency in order to protect from ban
 		for i := 0; i < 10; i++ {
-
-			e = make(chan err, 1)
-			o = make(chan LinksBlob, 1)
-
-			go func() {
-				if links, err := ggl.getLinks(ctx, key, i); err != nil {
-					e <- err
-				} else {
-					o <- links
-				}
-			}()
-
-			select {
-			case <-ctx.Done():
-				return
-			case errc <- <-e:
-			case out <- <-o:
-			}
-
-			///////////////////////////
-
-			d = make(chan struct{})
-			go func() {
-				if links, err := ggl.getLinks(ctx, key, i); err != nil {
-					errc <- err
-				} else {
-					out <- links
-				}
-				close(d)
-			}()
-
-			select {
-			case <-ctx.Done():
-				errc = make(chan err, 1)
-				out = make(chan LinksBlob, 1)
-				return
-			case <-d:
-			}
-
-			///////////////////////////
-			links, err := ggl.getLinks(ctx, key, i)
-
-			if err != nil {
-				select {
-				case errc <- err:
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			select {
-			case out <- LinksBlob(links, key):
-			case <-ctx.Done():
-				return
-			}
-
-			///////////////////////
-
-			links, err := ggl.getLinks(ctx, key, i)
-
-			if err != nil {
-				if err == context.Canceled {
-					return
-				}
-
-				select {
-				case <-ctx.Done():
-					return
-				case errc <- err:
-					continue
-				}
-			}
-
-			select {
-			case <-ctx.Done():
-				return
-			case out <- LinksBlob(links, key):
-			}
-
-			///////////////////////
-
 			links, err := ggl.getLinks(ctx, key, i)
 
 			if err != nil {
@@ -136,7 +54,7 @@ func glinksWorker(ctx context.Context, in <-chan string, out chan<- LinksBlob, e
 					return
 				}
 				errc <- err
-				continue
+				break
 			}
 
 			select {
@@ -149,7 +67,7 @@ func glinksWorker(ctx context.Context, in <-chan string, out chan<- LinksBlob, e
 	}
 }
 
-func glinksWorker(ctx context.Context, in <-chan string, out chan<- LinksBlob, errc chan<- error) {
+func glinksWorker3(ctx context.Context, in <-chan string, out chan<- LinksBlob, errc chan<- error) {
 	for key := range in {
 
 		// query 10 pages one by one, without concurrency in order to protect from ban
@@ -172,6 +90,99 @@ func glinksWorker(ctx context.Context, in <-chan string, out chan<- LinksBlob, e
 			}
 		}
 	}
+}
+
+func glinksWorker1(ctx context.Context, in <-chan string, out chan<- LinksBlob, errc chan<- error) {
+	i, o, e := in, out, errc
+	o, e = nil, nil
+	var err error
+	var lblob LinksBlob
+	lo := make(chan LinksBlob, 1)
+	lo_ := lo
+	lo = nil
+	le := make(chan error, 1)
+	le_ := le
+	le = nil
+
+	for {
+		select {
+		case key, ok := <-i:
+			if !ok {
+				return
+			}
+			i = nil
+
+			go func() {
+				defer func() { i = in }()
+
+				for p := 0; p < 10; p++ {
+					links, err := ggl.getLinks(ctx, key, p)
+					if err != nil {
+						le <- err
+						return
+					}
+					lo <- LinksBlob{links, key}
+				}
+			}()
+		case err = <-le:
+			le = nil
+			e = errc
+		case lblob = <-lo:
+			lo = nil
+			o = out
+		case o <- lblob:
+			lo = lo_
+		case e <- err:
+			le = le_
+		case <-ctx.Done():
+			return
+
+		}
+	}
+}
+
+func glinksWorker2(ctx context.Context, in <-chan string, out chan<- LinksBlob, errc chan<- error) {
+	ec := make(chan error)
+	go func() {
+		for e := range ec {
+			errc <- e
+		}
+	}()
+
+	oc := make(chan LinksBlob)
+	go func() {
+		for o := range oc {
+			out <- o
+		}
+	}()
+
+	c := make(chan struct{})
+	go func() {
+		for key := range in {
+			// query 10 pages one by one, without concurrency in order to protect from ban
+			for i := 0; i < 10; i++ {
+				links, err := ggl.getLinks(ctx, key, p)
+				if err != nil {
+					ec <- err
+					break
+				}
+				oc <- LinksBlob{links, key}
+			}
+		}
+		close(c)
+	}()
+
+	go func() {
+		select {
+		case <-c:
+		case <-ctx.Done():
+			oc1 := oc
+			oc = make(chan LinksBlob, 1)
+			close(oc1)
+
+			///!!! error - we can't rewrite chan with out lock
+		}
+	}()
 }
 
 func shopCreatorsPool(ctx context.Context, in <-chan LinksBlob, out chan<- shop, errc chan<- error) {
