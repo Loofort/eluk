@@ -47,6 +47,7 @@ func glinksWorker(ctx context.Context, in <-chan string, out chan<- LinksBlob, e
 
 		// query 10 pages one by one, without concurrency in order to protect from ban
 		for i := 0; i < 10; i++ {
+			// suppose if ctx is done , getLinks returns immediatly with error
 			links, err := ggl.getLinks(ctx, key, i)
 
 			if err != nil {
@@ -73,6 +74,12 @@ func glinksWorker3(ctx context.Context, in <-chan string, out chan<- LinksBlob, 
 		// query 10 pages one by one, without concurrency in order to protect from ban
 		for i := 0; i < 10; i++ {
 			links, err := ggl.getLinks(ctx, key, i)
+
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 
 			if err != nil {
 				select {
@@ -185,6 +192,73 @@ func glinksWorker2(ctx context.Context, in <-chan string, out chan<- LinksBlob, 
 	}()
 }
 
+// pattern with two type of goroutines, 1 - payload; 2- merger
+func best() {
+	g1 := func(ctx context.Context, in <-chan string, errc chan<- error) chan<- LinksBlob {
+		out := make(chan LinksBlob)
+		go func() {
+			for key := range in {
+				for i := 0; i < 10; i++ {
+					links, err := web.getLinks(ctx, key, i)
+					if err != nil {
+						errc <- err
+						break
+					}
+					out <- LinksBlob{links, key}
+				}
+			}
+			close(out)
+		}()
+		return out
+	}
+
+	g2 := func(ctx context.Context, n int, ins ...chan<- LinksBlob) chan<- LinksBlob {
+		out = make(chan LinksBlob, n)
+		output := func(in <-chan LinksBlob, out <-chan LinksBlob) {
+			for o := range in {
+				select {
+				case <-ctx.Done():
+				default:
+					select {
+					case <-ctx.Done():
+					case out <- o:
+					}
+				}
+			}
+
+			for {
+				select {
+				case <-ctx.Done():
+				case o, ok := <-in:
+					if !ok {
+						break
+					}
+					select {
+					case <-ctx.Done():
+					case out <- o:
+					}
+				}
+			}
+
+			in_ := in
+			for {
+				select {
+				case <-ctx.Done():
+					out = nil
+				case o, ok := <-in:
+					if !ok {
+						break
+					}
+					in = nil
+				case out <- o:
+					in = in_
+				}
+			}
+
+		}()
+		return out
+	}
+}
 func shopCreatorsPool(ctx context.Context, in <-chan LinksBlob, out chan<- shop, errc chan<- error) {
 	for blob := range in {
 		for _, link = range blob.links {
