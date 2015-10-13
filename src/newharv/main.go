@@ -1,287 +1,278 @@
 // Architecture note:
-// scope of processes of the same type is pool
-// live circle of each task is a flow transfering from pool to pool
-//
-// there is a manger that can interact with each pool directly.
-// the manger can receive error/done signal from pool and ask other pool to finish
-//
+// Pipeline arhitecture, the flow is going from stage to stage
+// Each stage can rise an error.
+// Each stage has separate error handling that able to cancel current stage and all upstream
+
 package main
 
+import (
+	"golang.org/x/net/context"
+)
+
+// global context parrent for each context
+var gx, gcancel = context.WithCancel(context.Background())
+
 func main() {
+	c := func() {}
 
-	keyc := make(chan string, 1)
-	kerrc := make(chan error)
-	ctx, kcancel = context.WithCancel(context.Background())
-	go inputWorker(ctx, keyc, kerrc)
+	// read keyword from stdin
+	ctx, cancel := context.WithCancel(gx)
+	keyc, errc := stdinStage(ctx)
+	c = errHanler(c, cancel, errc, "read kewrods")
 
-	// pool obtains links from google, just one thread
-	linksc := make(chan LinksBlob, 1)
-	gerrc := make(chan error)
-	ctx, gcancel = context.WithCancel(context.Background())
-	go glinksWorker(ctx, keyc, linksc, gerrc)
+	// obtains links from google, just one thread
+	ctx, cancel = context.WithCancel(gx)
+	serpc, errc := serpStage(ctx, keyc)
+	c = errHanler(c, cancel, errc, "get links")
 
-	// pool creates shops in db, checks for unique
-	// unlimiited threads (infact limited by mgo pool size)
-	shopc := make(chan Shop, 1)
-	merrc := make(chan error)
-	go shopCreatorsPool(ctx, linksc, shopc, merrc)
-
-	// the god runtime
-	// when we got fatal error from particular pool we need to
-	//   cancel all pools befor,
-	//   cancel all workers of current pool,
-	//   and close current output channel, if no other pool is writing to it
-	for {
-		select {
-		case err := <-gerrc:
-			gcancel()
-
+	// creates shops
+	shopc := make(chan Shop, 100)
+	go func() {
+		for blob := range serpc {
+			for _, link := range serp.links {
+				shopc <- NewShop(link, serp.key)
+			}
 		}
+	}()
 
-	}
+	// save shops in db, checks for unique
+	savedc, c := stageDB(shopc, c, "save shop")
 
+	// check if grabbed links is really a shop
+	checkedc, c := stage(checkStage, savedc, c, "check shop")
+
+	// save checked shops in db, checks for unique
+	savedCheckedc, c := stageDB(checkedc, c, "save checked shop")
+
+	// gather emails from site
+	gatheredc, c := stage(emailStage, savedCheckedc, c, "gather email")
+
+	// save checked shops in db, checks for unique
+	savedGatheredc, c := stageDB(gatheredc, c, "save emails")
 }
 
-func glinksWorker(ctx context.Context, in <-chan string, out chan<- LinksBlob, errc chan<- error) {
-	for key := range in {
+// helper function. Starts stage that has in and out channel type of Shop
+func stage(worker func() (chan Shop, chan error), in <-chan Shop, cancel func(), name string) (<-chan Shop, func()) {
+	ctx, cncl := context.WithCancel(gx)
+	out, errc := worker(ctx, in)
+	cancel = errHanler(cancel, cncl, errc, name)
+	return out, cancel
+}
 
-		// query 10 pages one by one, without concurrency in order to protect from ban
-		for i := 0; i < 10; i++ {
-			// suppose if ctx is done , getLinks returns immediatly with error
-			links, err := ggl.getLinks(ctx, key, i)
+// inherits context from DB gloabl contex.
+// Executes Upsert worker
+func stageDB(in <-chan Shop, cancel func(), name string) (<-chan Shop, func()) {
+	ctx, cncl := context.WithCancel(gx)
+	out, errc := upsertStage(ctx, in)
+	// if database throws an error whole program should be terminated
+	errHanler(gcancel, cncl, errc, name)
+	// but global cancel shouldn't be executed in upstream cancelation event.
+	cancel = addCancel(cancel, cncl)
+	return out, cancel
+}
+
+// runs new error handler for a Stage in goroutine,
+// returuns cancel func that able to cancel all previous stage
+// In error case handler executes cancel func
+func errHanler(cancel, cancelStage func(), errc <-chan error, name string) func() {
+	cancel = addCancel(cancel, cancelStage)
+
+	go func() {
+		for err := range errc {
+			if err == context.Canceled {
+				glog.Infof("[%s] worker is canceled", name)
+				continue
+			}
+
+			glog.Errorf("[%s] is going to stop because of err: %v", name, err)
+			cancel()
+		}
+		glog.Infof("[%s] stoped", name)
+	}()
+
+	return cancel
+}
+
+// sums two cancle funcs
+func addCancel(cancel, cancelStage func()) func() {
+	return func() {
+		cancel()
+		cancelStage()
+	}
+}
+
+// ################################### STAGES HANDLERS ############################################
+
+// stdinStage
+func stdinStage(ctx context.Context) (chan<- string, chan<- error) {
+	out := make(chan LinksBlob)
+	errc := make(chan error)
+
+	go func() {
+		defer close(out)
+		defer close(errc)
+		lr := NewLineReader(os.Stdin)
+		for {
+			key, err := lr.Next(ctx)
+			if err == io.EOF {
+				glog.Info("No more keywords")
+				return
+			}
 
 			if err != nil {
-				if err == context.Canceled {
-					return
-				}
 				errc <- err
-				break
+				return
 			}
 
 			select {
-			case <-ctx.Done():
-				return
-			case out <- LinksBlob(links, key):
-			}
-
-		}
-	}
-}
-
-func glinksWorker3(ctx context.Context, in <-chan string, out chan<- LinksBlob, errc chan<- error) {
-	for key := range in {
-
-		// query 10 pages one by one, without concurrency in order to protect from ban
-		for i := 0; i < 10; i++ {
-			links, err := ggl.getLinks(ctx, key, i)
-
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			if err != nil {
-				select {
-				case errc <- err:
-					continue
-				case <-ctx.Done():
-					return
-				}
-			}
-
-			select {
-			case out <- LinksBlob(links, key):
+			case out <- key:
 			case <-ctx.Done():
 				return
 			}
-		}
-	}
-}
-
-func glinksWorker1(ctx context.Context, in <-chan string, out chan<- LinksBlob, errc chan<- error) {
-	i, o, e := in, out, errc
-	o, e = nil, nil
-	var err error
-	var lblob LinksBlob
-	lo := make(chan LinksBlob, 1)
-	lo_ := lo
-	lo = nil
-	le := make(chan error, 1)
-	le_ := le
-	le = nil
-
-	for {
-		select {
-		case key, ok := <-i:
-			if !ok {
-				return
-			}
-			i = nil
-
-			go func() {
-				defer func() { i = in }()
-
-				for p := 0; p < 10; p++ {
-					links, err := ggl.getLinks(ctx, key, p)
-					if err != nil {
-						le <- err
-						return
-					}
-					lo <- LinksBlob{links, key}
-				}
-			}()
-		case err = <-le:
-			le = nil
-			e = errc
-		case lblob = <-lo:
-			lo = nil
-			o = out
-		case o <- lblob:
-			lo = lo_
-		case e <- err:
-			le = le_
-		case <-ctx.Done():
-			return
-
-		}
-	}
-}
-
-func glinksWorker2(ctx context.Context, in <-chan string, out chan<- LinksBlob, errc chan<- error) {
-	ec := make(chan error)
-	go func() {
-		for e := range ec {
-			errc <- e
 		}
 	}()
+	return out, errc
+}
 
-	oc := make(chan LinksBlob)
-	go func() {
-		for o := range oc {
-			out <- o
-		}
-	}()
+// serp - Search Engine Result Page
+// one thread, bacause google doesn't like load activity
+func serpStage(ctx context.Context, in <-chan string) (chan<- Serp, chan<- error) {
+	out := make(chan<- Serp)
+	errc := make(chan<- error)
 
-	c := make(chan struct{})
 	go func() {
+		defer close(out)
+		defer close(errc)
+
+		// don't check cancelation on IN
 		for key := range in {
-			// query 10 pages one by one, without concurrency in order to protect from ban
-			for i := 0; i < 10; i++ {
-				links, err := ggl.getLinks(ctx, key, p)
+			var last string
+			var i int
+			for i = 0; i < 10; i++ {
+				links, err := web.getLinks(ctx, key, i)
 				if err != nil {
-					ec <- err
+					errc <- err
 					break
 				}
-				oc <- LinksBlob{links, key}
+
+				if len(links) == 0 {
+					glog.Infof("no search results for keyword: %s", key)
+					break
+				}
+
+				// if we got the same urls it means we on last result page
+				// and have to skip any pending queries
+				if i > 0 && last == links[len(links)-1] {
+					break
+				}
+				last = links[len(links)-1]
+
+				select {
+				case out <- Serp{links, key}:
+				case <-ctx.Done():
+					return
+				}
 			}
+
+			glog.Infof("for keyword %s SE found %d pages", key, i)
 		}
-		close(c)
 	}()
 
+	return out, errc
+}
+
+// upsert shop in db, if it doesn't exist - insert.
+// unlimited count of worker (limited by mgo pool)
+func upsertStage(ctx context.context, in <-chan Shop) (chan<- Shop, chan<- error) {
+	out := make(chan Shop)
+	errc := make(chan error)
 	go func() {
-		select {
-		case <-c:
-		case <-ctx.Done():
-			oc1 := oc
-			oc = make(chan LinksBlob, 1)
-			close(oc1)
+		defer close(out)
+		defer close(errc)
 
-			///!!! error - we can't rewrite chan with out lock
-		}
-	}()
-}
-
-// pattern with two type of goroutines, 1 - payload; 2- merger
-func best() {
-	g1 := func(ctx context.Context, in <-chan string, errc chan<- error) chan<- LinksBlob {
-		out := make(chan LinksBlob)
-		go func() {
-			for key := range in {
-				for i := 0; i < 10; i++ {
-					links, err := web.getLinks(ctx, key, i)
-					if err != nil {
-						errc <- err
-						break
-					}
-					out <- LinksBlob{links, key}
-				}
-			}
-			close(out)
-		}()
-		return out
-	}
-
-	g2 := func(ctx context.Context, n int, ins ...chan<- LinksBlob) chan<- LinksBlob {
-		out = make(chan LinksBlob, n)
-		output := func(in <-chan LinksBlob, out <-chan LinksBlob) {
-			for o := range in {
-				select {
-				case <-ctx.Done():
-				default:
-					select {
-					case <-ctx.Done():
-					case out <- o:
-					}
-				}
-			}
-
-			for {
-				select {
-				case <-ctx.Done():
-				case o, ok := <-in:
-					if !ok {
-						break
-					}
-					select {
-					case <-ctx.Done():
-					case out <- o:
-					}
-				}
-			}
-
-			in_ := in
-			for {
-				select {
-				case <-ctx.Done():
-					out = nil
-				case o, ok := <-in:
-					if !ok {
-						break
-					}
-					in = nil
-				case out <- o:
-					in = in_
-				}
-			}
-
-		}()
-		return out
-	}
-}
-func shopCreatorsPool(ctx context.Context, in <-chan LinksBlob, out chan<- shop, errc chan<- error) {
-	for blob := range in {
-		for _, link = range blob.links {
+		var wg sync.WaitGroup
+		for shop := range in {
+			//spawn new goroutine to create a shop
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
 
-				shop := NewShop(link, blob.key)
-				ok, err := db.Save(ctx, shop)
-
-				if err != nil {
-					select {
-					case errc <- err:
-					case <-ctx.Done():
-					}
+				ok, err := db.Upsert(ctx, shop)
+				if db.IsDub(err) {
 					return
 				}
 
-				if ok {
+				if err != nil {
+					errc <- err
+					return
+				}
+
+				// do not foraward invalid shops
+				if shop.Invalid {
+					return
+				}
+
+				select {
+				case out <- shop:
+				case <-ctx.Done():
+				}
+			}()
+		}
+
+		wg.Wait()
+	}()
+
+	return out, errc
+}
+
+// try to find a signal word on shop page
+// pool of threads
+func sheckStage(ctx context.Context, in <-chan Shop) (chan<- Shop, chan<- error) {
+	out := make(chan Shop)
+	errc := make(chan error)
+
+	var wg sync.WaitGroup
+	workerCount := 100
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				// read IN channel
+				select {
+				case <-ctx.Done():
+					return
+				case shop, ok := <-in:
+					if !ok {
+						return
+					}
+
+					ok, err := web.isShop(ctx, shop.Link)
+					if err != nil {
+						errc <- err
+						return
+					}
+
+					if !ok {
+						glog.Infof("Site %s is not a shop", shop.Host)
+						shop.Invalid = true
+					}
+
+					shop.Stage = STG_CHECKED
 					select {
 					case out <- shop:
 					case <-ctx.Done():
 					}
 				}
-			}()
-		}
+			}
+		}()
 	}
+
+	go func() {
+		wg.Wait()
+		close(out)
+		close(errc)
+	}()
+
+	return out, errc
 }
