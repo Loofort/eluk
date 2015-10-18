@@ -25,9 +25,23 @@ func main() {
 	serpc, errc := serpStage(ctx, keyc)
 	c = errHanler(c, cancel, errc, "get links")
 
+	// create shop
+	shopc, c := create(serpc, c)
+
+	// check if grabbed links is really a shop
+	checkedc, c := stage(checkStage, shopc, c, "check shop")
+
+	// gather emails from site
+	gatheredc, c := stage(emailStage, checkedc, c, "gather email")
+}
+
+// create shops object, save it to db
+func create(serpc <-chan Serp, cancel func()) (<-chan Shop, func()) {
 	// creates shops
+	// this goroutine is not cancelable, no ctx is needed
 	shopc := make(chan Shop, 100)
 	go func() {
+		defer close(shopc)
 		for blob := range serpc {
 			for _, link := range serp.links {
 				shopc <- NewShop(link, serp.key)
@@ -36,19 +50,8 @@ func main() {
 	}()
 
 	// save shops in db, checks for unique
-	savedc, c := stageDB(shopc, c, "save shop")
-
-	// check if grabbed links is really a shop
-	checkedc, c := stage(checkStage, savedc, c, "check shop")
-
-	// save checked shops in db, checks for unique
-	savedCheckedc, c := stageDB(checkedc, c, "save checked shop")
-
-	// gather emails from site
-	gatheredc, c := stage(emailStage, savedCheckedc, c, "gather email")
-
-	// save checked shops in db, checks for unique
-	savedGatheredc, c := stageDB(gatheredc, c, "save emails")
+	savedc, cancel := stageDB(shopc, cancel, "save shop")
+	return savedc, cancel
 }
 
 // helper function. Starts stage that has in and out channel type of Shop
@@ -56,7 +59,10 @@ func stage(worker func() (chan Shop, chan error), in <-chan Shop, cancel func(),
 	ctx, cncl := context.WithCancel(gx)
 	out, errc := worker(ctx, in)
 	cancel = errHanler(cancel, cncl, errc, name)
-	return out, cancel
+
+	// save to db
+	dbout, cancel := stageDB(out, cancel, name+", save")
+	return dbout, cancel
 }
 
 // inherits context from DB gloabl contex.
@@ -102,6 +108,50 @@ func addCancel(cancel, cancelStage func()) func() {
 }
 
 // ################################### STAGES HANDLERS ############################################
+
+// upsert shop in db, if it doesn't exist - insert.
+// unlimited count of worker (limited by mgo pool)
+func upsertStage(ctx context.context, in <-chan Shop) (chan<- Shop, chan<- error) {
+	out := make(chan Shop)
+	errc := make(chan error)
+	go func() {
+		defer close(out)
+		defer close(errc)
+
+		var wg sync.WaitGroup
+		for shop := range in {
+			//spawn new goroutine to create a shop
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				ok, err := db.Upsert(ctx, shop)
+				if db.IsDub(err) {
+					return
+				}
+
+				if err != nil {
+					errc <- err
+					return
+				}
+
+				// do not foraward invalid shops
+				if shop.Invalid {
+					return
+				}
+
+				select {
+				case out <- shop:
+				case <-ctx.Done():
+				}
+			}()
+		}
+
+		wg.Wait()
+	}()
+
+	return out, errc
+}
 
 // stdinStage
 func stdinStage(ctx context.Context) (chan<- string, chan<- error) {
@@ -181,50 +231,6 @@ func serpStage(ctx context.Context, in <-chan string) (chan<- Serp, chan<- error
 	return out, errc
 }
 
-// upsert shop in db, if it doesn't exist - insert.
-// unlimited count of worker (limited by mgo pool)
-func upsertStage(ctx context.context, in <-chan Shop) (chan<- Shop, chan<- error) {
-	out := make(chan Shop)
-	errc := make(chan error)
-	go func() {
-		defer close(out)
-		defer close(errc)
-
-		var wg sync.WaitGroup
-		for shop := range in {
-			//spawn new goroutine to create a shop
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
-				ok, err := db.Upsert(ctx, shop)
-				if db.IsDub(err) {
-					return
-				}
-
-				if err != nil {
-					errc <- err
-					return
-				}
-
-				// do not foraward invalid shops
-				if shop.Invalid {
-					return
-				}
-
-				select {
-				case out <- shop:
-				case <-ctx.Done():
-				}
-			}()
-		}
-
-		wg.Wait()
-	}()
-
-	return out, errc
-}
-
 // try to find a signal word on shop page
 // pool of threads
 func sheckStage(ctx context.Context, in <-chan Shop) (chan<- Shop, chan<- error) {
@@ -275,4 +281,12 @@ func sheckStage(ctx context.Context, in <-chan Shop) (chan<- Shop, chan<- error)
 	}()
 
 	return out, errc
+}
+
+// on this stage we crawl site for one layer of depth.
+// we limit crawlers per one site up to 5 to do not overload crawled site.
+// from our side we have two type of resource - bandwidth and cpu. our performance will be limited by one or both of this resources and it's likely be bandwidth.
+// we should limit overall amount of goroutines to be protected from net channel overload and increasing latency.
+func emailStage(ctx context.context, in <-chan Shop) (chan<- Shop, chan<- error) {
+
 }

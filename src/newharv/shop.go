@@ -1,9 +1,7 @@
 package main
 
-type Stage int
-
 const (
-	STG_NEW Stage = iota
+	STG_NEW int = iota
 	STG_CHECKED
 	STG_MAIL
 	STG_STAT
