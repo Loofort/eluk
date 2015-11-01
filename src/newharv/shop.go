@@ -1,5 +1,7 @@
 package main
 
+import "net/url"
+
 const (
 	STG_NEW int = iota
 	STG_CHECKED
@@ -12,17 +14,23 @@ type Shop struct {
 	Host    string
 	Key     string
 	Lang    string
-	Stage   Stage
+	Stage   int
 	Invalid bool
 }
 
-func NewShop(link, key string) Shop {
-	match := domainRE.FindStringSubmatch(link)
-	return Shop{
+func NewShop(link, key string) (Shop, error) {
+	sh := Shop{
 		Link:  link,
-		Host:  match[1],
 		Key:   key,
 		Lang:  "en",
 		Stage: STG_NEW,
 	}
+
+	url, err := url.Parse(link)
+	if err != nil {
+		return sh, err
+	}
+
+	sh.Host = url.Host
+	return sh, err
 }

@@ -6,13 +6,24 @@
 package main
 
 import (
+	"./db"
+	"./reader"
+	"./web"
+	"flag"
+	"github.com/golang/glog"
 	"golang.org/x/net/context"
+	"io"
+	"os"
+	"strings"
+	"sync"
+	"time"
 )
 
 // global context parrent for each context
 var gx, gcancel = context.WithCancel(context.Background())
 
 func main() {
+	flag.Parse()
 	c := func() {}
 
 	// read keyword from stdin
@@ -32,7 +43,11 @@ func main() {
 	checkedc, c := stage(checkStage, shopc, c, "check shop")
 
 	// gather emails from site
-	gatheredc, c := stage(emailStage, checkedc, c, "gather email")
+	gatheredc, _ := stage(emailStage, checkedc, c, "gather email")
+	//stage(emailStage, checkedc, c, "gather email")
+
+	for range gatheredc {
+	}
 }
 
 // create shops object, save it to db
@@ -42,9 +57,14 @@ func create(serpc <-chan Serp, cancel func()) (<-chan Shop, func()) {
 	shopc := make(chan Shop, 100)
 	go func() {
 		defer close(shopc)
-		for blob := range serpc {
+		for serp := range serpc {
 			for _, link := range serp.links {
-				shopc <- NewShop(link, serp.key)
+				shop, err := NewShop(link, serp.key)
+				if err != nil {
+					glog.Errorf("can't parse shop link %s: %v", link, err)
+					continue
+				}
+				shopc <- shop
 			}
 		}
 	}()
@@ -55,14 +75,14 @@ func create(serpc <-chan Serp, cancel func()) (<-chan Shop, func()) {
 }
 
 // helper function. Starts stage that has in and out channel type of Shop
-func stage(worker func() (chan Shop, chan error), in <-chan Shop, cancel func(), name string) (<-chan Shop, func()) {
+func stage(worker func(context.Context, <-chan Shop) (<-chan Shop, <-chan error), in <-chan Shop, cancel func(), name string) (<-chan Shop, func()) {
 	ctx, cncl := context.WithCancel(gx)
 	out, errc := worker(ctx, in)
 	cancel = errHanler(cancel, cncl, errc, name)
 
 	// save to db
-	dbout, cancel := stageDB(out, cancel, name+", save")
-	return dbout, cancel
+	//out, cancel := stageDB(out, cancel, name+", save")
+	return out, cancel
 }
 
 // inherits context from DB gloabl contex.
@@ -107,11 +127,16 @@ func addCancel(cancel, cancelStage func()) func() {
 	}
 }
 
+// check if error is thrown by context
+func ctxErr(err error) bool {
+	return (err == context.Canceled || err == context.DeadlineExceeded)
+}
+
 // ################################### STAGES HANDLERS ############################################
 
 // upsert shop in db, if it doesn't exist - insert.
 // unlimited count of worker (limited by mgo pool)
-func upsertStage(ctx context.context, in <-chan Shop) (chan<- Shop, chan<- error) {
+func upsertStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error) {
 	out := make(chan Shop)
 	errc := make(chan error)
 	go func() {
@@ -125,7 +150,7 @@ func upsertStage(ctx context.context, in <-chan Shop) (chan<- Shop, chan<- error
 			go func() {
 				defer wg.Done()
 
-				ok, err := db.Upsert(ctx, shop)
+				err := db.Upsert(ctx, shop)
 				if db.IsDub(err) {
 					return
 				}
@@ -135,14 +160,10 @@ func upsertStage(ctx context.context, in <-chan Shop) (chan<- Shop, chan<- error
 					return
 				}
 
-				// do not foraward invalid shops
-				if shop.Invalid {
-					return
-				}
-
 				select {
 				case out <- shop:
 				case <-ctx.Done():
+					errc <- ctx.Err()
 				}
 			}()
 		}
@@ -154,14 +175,14 @@ func upsertStage(ctx context.context, in <-chan Shop) (chan<- Shop, chan<- error
 }
 
 // stdinStage
-func stdinStage(ctx context.Context) (chan<- string, chan<- error) {
-	out := make(chan LinksBlob)
+func stdinStage(ctx context.Context) (<-chan string, <-chan error) {
+	out := make(chan string)
 	errc := make(chan error)
 
 	go func() {
 		defer close(out)
 		defer close(errc)
-		lr := NewLineReader(os.Stdin)
+		lr := reader.NewLineReader(os.Stdin)
 		for {
 			key, err := lr.Next(ctx)
 			if err == io.EOF {
@@ -176,7 +197,9 @@ func stdinStage(ctx context.Context) (chan<- string, chan<- error) {
 
 			select {
 			case out <- key:
+				glog.V(1).Infof("input key: %s\n", key)
 			case <-ctx.Done():
+				errc <- ctx.Err()
 				return
 			}
 		}
@@ -185,10 +208,15 @@ func stdinStage(ctx context.Context) (chan<- string, chan<- error) {
 }
 
 // serp - Search Engine Result Page
+type Serp struct {
+	links []string
+	key   string
+}
+
 // one thread, bacause google doesn't like load activity
-func serpStage(ctx context.Context, in <-chan string) (chan<- Serp, chan<- error) {
-	out := make(chan<- Serp)
-	errc := make(chan<- error)
+func serpStage(ctx context.Context, in <-chan string) (<-chan Serp, <-chan error) {
+	out := make(chan Serp)
+	errc := make(chan error)
 
 	go func() {
 		defer close(out)
@@ -199,7 +227,7 @@ func serpStage(ctx context.Context, in <-chan string) (chan<- Serp, chan<- error
 			var last string
 			var i int
 			for i = 0; i < 10; i++ {
-				links, err := web.getLinks(ctx, key, i)
+				links, err := web.GLinks(ctx, key, i)
 				if err != nil {
 					errc <- err
 					break
@@ -217,11 +245,24 @@ func serpStage(ctx context.Context, in <-chan string) (chan<- Serp, chan<- error
 				}
 				last = links[len(links)-1]
 
+				// need to make pause for google
+				pause := time.After(2 * time.Second)
+
 				select {
 				case out <- Serp{links, key}:
+					glog.V(1).Infof("for key=\"%s\" %d page got links: \n\t%s\n", key, i, strings.Join(links, "\n\t"))
 				case <-ctx.Done():
+					errc <- ctx.Err()
 					return
 				}
+
+				select {
+				case <-pause:
+				case <-ctx.Done():
+					errc <- ctx.Err()
+					return
+				}
+
 			}
 
 			glog.Infof("for keyword %s SE found %d pages", key, i)
@@ -233,7 +274,7 @@ func serpStage(ctx context.Context, in <-chan string) (chan<- Serp, chan<- error
 
 // try to find a signal word on shop page
 // pool of threads
-func sheckStage(ctx context.Context, in <-chan Shop) (chan<- Shop, chan<- error) {
+func checkStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error) {
 	out := make(chan Shop)
 	errc := make(chan error)
 
@@ -244,19 +285,26 @@ func sheckStage(ctx context.Context, in <-chan Shop) (chan<- Shop, chan<- error)
 		go func() {
 			defer wg.Done()
 			for {
-				// read IN channel
 				select {
 				case <-ctx.Done():
+					errc <- ctx.Err()
 					return
+
+				// read IN channel
 				case shop, ok := <-in:
 					if !ok {
 						return
 					}
 
-					ok, err := web.isShop(ctx, shop.Link)
-					if err != nil {
+					ok, err := web.IsShop(ctx, shop.Link)
+					// if error with site (or net) skip it, but rise a signal if it's context's error
+					if ctxErr(err) {
 						errc <- err
 						return
+					}
+					if err != nil {
+						glog.Errorf("can't check shop %s: %v", shop.Link, err)
+						continue
 					}
 
 					if !ok {
@@ -268,6 +316,7 @@ func sheckStage(ctx context.Context, in <-chan Shop) (chan<- Shop, chan<- error)
 					select {
 					case out <- shop:
 					case <-ctx.Done():
+						errc <- ctx.Err()
 					}
 				}
 			}
@@ -287,6 +336,80 @@ func sheckStage(ctx context.Context, in <-chan Shop) (chan<- Shop, chan<- error)
 // we limit crawlers per one site up to 5 to do not overload crawled site.
 // from our side we have two type of resource - bandwidth and cpu. our performance will be limited by one or both of this resources and it's likely be bandwidth.
 // we should limit overall amount of goroutines to be protected from net channel overload and increasing latency.
-func emailStage(ctx context.context, in <-chan Shop) (chan<- Shop, chan<- error) {
+func emailStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error) {
+	out := make(chan Shop)
+	errc := make(chan error)
 
+	go func() {
+		defer close(out)
+		defer close(errc)
+
+		// for each shop start crawler
+		for shop := range in {
+			if shop.Invalid {
+				continue
+			}
+			// to avoid blocking on queuing new link and to avoid bulk of goroutines
+			// we need intermidiate goroutine to handle links queue.
+			// crawler has two queues - to pop and push urls
+			popc := make(chan string, 100)
+			pushc := make(chan []string, 100)
+			go func() {
+
+				link := shop.Link
+				tasks := make([]string, 0, 100)
+				tasksc := popc
+
+				for {
+					select {
+					case links, ok := <-pushc:
+						if !ok {
+							return
+						}
+						if len(links) == 0 {
+							continue
+						}
+
+						tasks := append(tasks, links...)
+						if tasksc == nil {
+							tasksc = popc
+							link, tasks = tasks[0], tasks[1:]
+						}
+
+					case tasksc <- link:
+						if len(tasks) == 0 {
+							tasksc = nil
+							continue
+						}
+						link, tasks = tasks[0], tasks[1:]
+					}
+				}
+
+			}()
+
+			// start several workers per each crawler
+			for i := 0; i < 2; i++ {
+				go func() {
+
+					// wroker obtains url from queue, requests and parses page, and pushes new links to queue
+					for link := range popc {
+						links, err := web.Links(ctx, link)
+
+						// ignore error that are related to http workflow
+						if ctxErr(err) {
+							errc <- err
+							return
+						}
+						if err != nil {
+							glog.Errorf("crawler can't get page %s: %v", link, err)
+						}
+
+						pushc <- links
+					}
+				}()
+			}
+		}
+	}()
+
+	return out, errc
 }
