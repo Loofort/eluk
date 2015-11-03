@@ -2,6 +2,8 @@ package main
 
 import "net/url"
 
+var id int
+
 const (
 	STG_NEW int = iota
 	STG_CHECKED
@@ -10,6 +12,7 @@ const (
 )
 
 type Shop struct {
+	ID      int
 	Link    string
 	Host    string
 	Key     string
@@ -19,7 +22,9 @@ type Shop struct {
 }
 
 func NewShop(link, key string) (Shop, error) {
+	id++
 	sh := Shop{
+		ID:    id,
 		Link:  link,
 		Key:   key,
 		Lang:  "en",

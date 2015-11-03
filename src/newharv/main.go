@@ -40,14 +40,17 @@ func main() {
 	shopc, c := create(serpc, c)
 
 	// check if grabbed links is really a shop
-	checkedc, c := stage(checkStage, shopc, c, "check shop")
+	//shopc, c = stage(checkStage, shopc, c, "check shop")
 
 	// gather emails from site
-	gatheredc, _ := stage(emailStage, checkedc, c, "gather email")
+	shopc, _ = stage(emailStage, shopc, c, "gather email")
 	//stage(emailStage, checkedc, c, "gather email")
 
-	for range gatheredc {
+	glog.Infof("Start\n")
+	for range shopc {
 	}
+	glog.Infof("End\n")
+
 }
 
 // create shops object, save it to db
@@ -64,6 +67,7 @@ func create(serpc <-chan Serp, cancel func()) (<-chan Shop, func()) {
 					glog.Errorf("can't parse shop link %s: %v", link, err)
 					continue
 				}
+				glog.V(2).Infof("CREATED %#v", shop)
 				shopc <- shop
 			}
 		}
@@ -147,7 +151,7 @@ func upsertStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error
 		for shop := range in {
 			//spawn new goroutine to create a shop
 			wg.Add(1)
-			go func() {
+			go func(shop Shop) {
 				defer wg.Done()
 
 				err := db.Upsert(ctx, shop)
@@ -165,7 +169,7 @@ func upsertStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error
 				case <-ctx.Done():
 					errc <- ctx.Err()
 				}
-			}()
+			}(shop)
 		}
 
 		wg.Wait()
@@ -226,7 +230,7 @@ func serpStage(ctx context.Context, in <-chan string) (<-chan Serp, <-chan error
 		for key := range in {
 			var last string
 			var i int
-			for i = 0; i < 10; i++ {
+			for i = 0; i < 5; i++ {
 				links, err := web.GLinks(ctx, key, i)
 				if err != nil {
 					errc <- err
@@ -246,7 +250,7 @@ func serpStage(ctx context.Context, in <-chan string) (<-chan Serp, <-chan error
 				last = links[len(links)-1]
 
 				// need to make pause for google
-				pause := time.After(2 * time.Second)
+				pause := time.After(5 * time.Second)
 
 				select {
 				case out <- Serp{links, key}:
@@ -280,7 +284,7 @@ func checkStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error)
 
 	var wg sync.WaitGroup
 	workerCount := 100
-	for i := 0; i < workerCount; i++ {
+	for ; workerCount > 0; workerCount-- {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -295,6 +299,7 @@ func checkStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error)
 					if !ok {
 						return
 					}
+					glog.V(1).Infof("Going to check if shop %s", shop.Link)
 
 					ok, err := web.IsShop(ctx, shop.Link)
 					// if error with site (or net) skip it, but rise a signal if it's context's error
@@ -340,9 +345,10 @@ func emailStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error)
 	out := make(chan Shop)
 	errc := make(chan error)
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		defer close(out)
-		defer close(errc)
+		defer wg.Done()
 
 		// for each shop start crawler
 		for shop := range in {
@@ -354,12 +360,13 @@ func emailStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error)
 			// crawler has two queues - to pop and push urls
 			popc := make(chan string, 100)
 			pushc := make(chan []string, 100)
-			go func() {
 
-				link := shop.Link
+			wg.Add(1)
+			go func(link string) {
+				defer wg.Done()
+
 				tasks := make([]string, 0, 100)
 				tasksc := popc
-
 				for {
 					select {
 					case links, ok := <-pushc:
@@ -385,7 +392,7 @@ func emailStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error)
 					}
 				}
 
-			}()
+			}(shop.Link)
 
 			// start several workers per each crawler
 			for i := 0; i < 2; i++ {
@@ -411,5 +418,10 @@ func emailStage(ctx context.Context, in <-chan Shop) (<-chan Shop, <-chan error)
 		}
 	}()
 
+	go func() {
+		wg.Wait()
+		close(out)
+		close(errc)
+	}()
 	return out, errc
 }
